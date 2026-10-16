@@ -64,11 +64,11 @@ jobs:
           import textwrap
           from pathlib import Path
 
-          b = Path("src/scripts/builder/build.sh")
+          b = Path("src/scripts/builder/profiles/bluewake.sh")
           txt = b.read_text()
           txt = txt.replace(
-              "-mllvm -enable-machine-outliner=never",
-              "-mllvm -enable-machine-outliner=never -mllvm -enable-gvn-memdep=false"
+              'local flags="-mcpu=$device_cpu"',
+              'local flags="-mcpu=$device_cpu -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10 -mllvm -enable-gvn-memdep=false"'
           )
           b.write_text(txt)
 
@@ -107,14 +107,7 @@ jobs:
           '''))
           PY
 
-      - name: Step 1 - Verify & Prepare Source
-        run: |
-          cd src
-          scripts/builder/build.sh "../disc.iso" \
-            --combined-optimizations --lean-blocks --lean-memory --lean-deadlines --behaviour-timing \
-            --device-cpu apple-a13 --source-only
-
-      - name: Step 2 - Compile Turbo A13 Module & App
+      - name: Compile Turbo A13 Module & App (Fast SLP/Coalescer Cap)
         env:
           K_VAL: ${{ inputs.k }}
         run: |
