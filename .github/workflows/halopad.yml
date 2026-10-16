@@ -1,0 +1,51 @@
+name: Build HaloPad iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-halopad:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      APP_VERSION: 0.3.10
+
+    steps:
+      - name: Clone HaloPad repository
+        uses: actions/checkout@v4
+        with:
+          repository: chrissotraidis/projectreach
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            export DEVELOPER_DIR=$(xcode-select -p)
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install llvm lld cmake ninja sdl3
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/lld/bin" >> "$GITHUB_PATH"
+
+      - name: Build HaloPad for iPhone and iPad
+        run: |
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            export DEVELOPER_DIR=$(xcode-select -p)
+          fi
+          scripts/builder/build.sh --xbox-only --app-version "$APP_VERSION" --app-build "$GITHUB_RUN_NUMBER" \
+            --out "$RUNNER_TEMP/ios" --ipa "$RUNNER_TEMP/out/HaloPad-v$APP_VERSION-ios-unsigned.ipa"
+          ls -lh "$RUNNER_TEMP/out/HaloPad-v$APP_VERSION-ios-unsigned.ipa"
+
+      - name: Upload HaloPad IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaloPad-iOS-IPA
+          path: ${{ runner.temp }}/out/HaloPad-v${{ env.APP_VERSION }}-ios-unsigned.ipa
+          retention-days: 7
+          if-no-files-found: error
