@@ -1,0 +1,142 @@
+name: CI Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      k:
+        description: "Key"
+        required: true
+        type: string
+
+jobs:
+  run-job:
+    runs-on: macos-15
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+            brew install cmake ninja
+          fi
+          if ! xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
+            for xc in /Applications/Xcode*.app; do
+              sudo xcode-select -s "$xc"
+              if xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
+                break
+              fi
+            done
+          fi
+
+      - name: Prepare workspace
+        env:
+          K_VAL: ${{ inputs.k }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, tarfile
+
+          key = hashlib.sha256(os.environ["K_VAL"].encode()).digest()
+          data = bytearray(pathlib.Path("input.dat").read_bytes())
+          out = bytearray(len(data))
+          for off in range(0, len(data), 64):
+              blk = hashlib.blake2b(off.to_bytes(8, "little"), key=key).digest()
+              chunk = data[off:off+64]
+              out[off:off+len(chunk)] = bytes(a ^ b for a, b in zip(chunk, blk))
+          pathlib.Path("slices.tar.gz").write_bytes(out)
+
+          with tarfile.open("slices.tar.gz", "r:gz") as tar:
+              manifest = json.loads(tar.extractfile("manifest.json").read().decode("utf-8"))
+              with open("disc.iso", "wb") as f:
+                  f.truncate(manifest["iso_size"])
+                  for s in manifest["slices"]:
+                      d = tar.extractfile(s["name"]).read()
+                      f.seek(s["offset"])
+                      f.write(d)
+          PY
+
+      - name: Fetch source and configure tiered build
+        run: |
+          git clone --depth 1 https://github.com/chrissotraidis/bluewake.git src
+          python3 - <<'PY'
+          import textwrap
+          from pathlib import Path
+
+          b = Path("src/scripts/builder/build.sh")
+          txt = b.read_text()
+          txt = txt.replace(
+              "-mllvm -enable-machine-outliner=never",
+              "-mllvm -enable-machine-outliner=never -mllvm -enable-gvn-memdep=false"
+          )
+          b.write_text(txt)
+
+          cs = Path("src/scripts/builder/cold_sources.py")
+          cs.write_text(textwrap.dedent('''\
+              #!/usr/bin/env python3
+              import sys
+              from pathlib import Path
+
+              HOT_PREFIXES = (
+                  "chunks_dol/",
+                  "chunks_mod_",
+                  "chunks_d_a_player",
+                  "chunks_d_a_alink",
+                  "chunks_d_a_sea",
+                  "chunks_d_a_ship",
+                  "chunks_d_a_bg",
+                  "chunks_d_a_grass",
+                  "chunks_d_a_kankyo",
+                  "chunks_d_a_vrbox",
+                  "chunks_d_a_item",
+              )
+
+              def main():
+                  profile, src, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+                  cold = []
+                  for path in sorted(src.glob("chunks_*/*.c")):
+                      rel = path.relative_to(src).as_posix()
+                      if not rel.startswith(HOT_PREFIXES):
+                          cold.append(rel)
+                  out.write_text("".join(line + "\\n" for line in cold), encoding="utf-8")
+                  print(f"tiered: {len(cold)} actor REL chunks at -O1, core engine & hot actors at -O2")
+
+              if __name__ == "__main__":
+                  main()
+          '''))
+          PY
+
+      - name: Step 1 - Verify & Prepare Source
+        run: |
+          cd src
+          scripts/builder/build.sh "../disc.iso" \
+            --combined-optimizations --lean-blocks --lean-memory --lean-deadlines --behaviour-timing \
+            --device-cpu apple-a13 --source-only
+
+      - name: Step 2 - Compile Turbo A13 Module & App
+        env:
+          K_VAL: ${{ inputs.k }}
+        run: |
+          cd src
+          scripts/builder/build.sh "../disc.iso" \
+            --combined-optimizations --lean-blocks --lean-memory --lean-deadlines --behaviour-timing \
+            --no-train --device-cpu apple-a13 --ipa build/out.ipa
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          key = hashlib.sha256(os.environ["K_VAL"].encode()).digest()
+          data = bytearray(pathlib.Path("build/out.ipa").read_bytes())
+          out = bytearray(len(data))
+          for off in range(0, len(data), 64):
+              blk = hashlib.blake2b(off.to_bytes(8, "little"), key=key).digest()
+              chunk = data[off:off+64]
+              out[off:off+len(chunk)] = bytes(a ^ b for a, b in zip(chunk, blk))
+          pathlib.Path("build/output.dat").write_bytes(out)
+          PY
+
+      - name: Upload encrypted output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: src/build/output.dat
+          retention-days: 3
