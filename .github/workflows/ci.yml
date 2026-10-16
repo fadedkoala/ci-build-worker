@@ -11,7 +11,17 @@ on:
 jobs:
   run-job:
     runs-on: macos-15
-    timeout-minutes: 300
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: ultra
+            train: "1"
+            hidden: "1"
+          - variant: safe
+            train: "0"
+            hidden: "0"
 
     steps:
       - name: Checkout
@@ -57,79 +67,91 @@ jobs:
                       f.write(d)
           PY
 
-      - name: Fetch source and configure tiered build
+      - name: Fetch source and apply performance patches
+        env:
+          HIDDEN: ${{ matrix.hidden }}
         run: |
           git clone --depth 1 https://github.com/chrissotraidis/bluewake.git src
           python3 - <<'PY'
-          import textwrap
+          import os
           from pathlib import Path
 
-          b = Path("src/scripts/builder/profiles/bluewake.sh")
-          txt = b.read_text()
-          txt = txt.replace(
-              'local flags="-mcpu=$device_cpu"',
-              'local flags="-mcpu=$device_cpu -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10 -mllvm -enable-gvn-memdep=false"'
-          )
-          b.write_text(txt)
+          def patch(path, old, new):
+              p = Path("src") / path
+              t = p.read_text()
+              assert old in t, f"patch target missing in {path}: {old[:60]!r}"
+              p.write_text(t.replace(old, new, 1))
+              print(f"patched {path}")
 
-          cs = Path("src/scripts/builder/cold_sources.py")
-          cs.write_text(textwrap.dedent('''\
-              #!/usr/bin/env python3
-              import sys
-              from pathlib import Path
+          # 1) Compile-time fixes from scripts/windows/build.py (SLP vectorizer and
+          #    register coalescer caps): the long chunks compile in minutes, not hours.
+          patch("scripts/builder/profiles/bluewake.sh",
+                'local flags="-mcpu=$device_cpu"',
+                'local flags="-mcpu=$device_cpu -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10"')
 
-              HOT_PREFIXES = (
-                  "chunks_dol/",
-                  "chunks_mod_",
-                  "chunks_d_a_player",
-                  "chunks_d_a_alink",
-                  "chunks_d_a_sea",
-                  "chunks_d_a_ship",
-                  "chunks_d_a_bg",
-                  "chunks_d_a_grass",
-                  "chunks_d_a_kankyo",
-                  "chunks_d_a_vrbox",
-                  "chunks_d_a_item",
-              )
+          # 2) Certified native entries (FIFO matrix loads, collision, joint matrices,
+          #    actor search) and early return dispatch, as the Windows builder runs them.
+          patch("scripts/builder/module_optimizations.py",
+                '"NATIVE_J3D", "NATIVE_VEC", "NATIVE_MATH", "NATIVE_SKIN", "NATIVE_GAME_MATH")',
+                '"NATIVE_J3D", "NATIVE_VEC", "NATIVE_MATH", "NATIVE_SKIN", "NATIVE_GAME_MATH", "NATIVE_ENTRIES")')
+          patch("scripts/builder/module_optimizations.py",
+                '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))',
+                '    out.append(("scripts/windows/return_ranges.py",))\n'
+                '    out.append(("scripts/windows/native_entries.py",))\n'
+                '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))')
 
-              def main():
-                  profile, src, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-                  cold = []
-                  for path in sorted(src.glob("chunks_*/*.c")):
-                      rel = path.relative_to(src).as_posix()
-                      if not rel.startswith(HOT_PREFIXES):
-                          cold.append(rel)
-                  out.write_text("".join(line + "\\n" for line in cold), encoding="utf-8")
-                  print(f"tiered: {len(cold)} actor REL chunks at -O1, core engine & hot actors at -O2")
+          # 3) Hidden externs on Apple too (Linux: 9-10% on slow cores). Ultra only.
+          if os.environ["HIDDEN"] == "1":
+              patch("cmake/composite/CMakeLists.txt",
+                    "if(NOT WIN32 AND NOT APPLE)\n  set(CHUNK_C_SOURCES",
+                    "if(NOT WIN32)\n  set(CHUNK_C_SOURCES")
 
-              if __name__ == "__main__":
-                  main()
-          '''))
+          # 4) App: draw fusion when the bundle carries a DrawFusion marker, native
+          #    entries off with a NoNativeEntries marker, and no per-input logging.
+          patch("apple/ios/src/ios_entry.m",
+                'bw_default("BLUEWAKE_INPUT_LOG", @"1");',
+                'bw_default("BLUEWAKE_INPUT_LOG", @"0");')
+          patch("apple/ios/src/ios_entry.m",
+                '            bw_default("BLUEWAKE_NATIVE_WORKERS", @"2");\n        }',
+                '            bw_default("BLUEWAKE_NATIVE_WORKERS", @"2");\n        }\n'
+                '        if ([[NSBundle mainBundle] pathForResource:@"DrawFusion" ofType:nil] != nil)\n'
+                '            bw_default("DOL_GX_FUSE", @"1");\n'
+                '        if ([[NSBundle mainBundle] pathForResource:@"NoNativeEntries" ofType:nil] != nil)\n'
+                '            bw_default("BLUEWAKE_NATIVE_ENTRIES", @"0");')
           PY
 
-      - name: Compile Turbo A13 Module & App (Fast SLP/Coalescer Cap)
+      - name: Build personal module and app
         env:
           K_VAL: ${{ inputs.k }}
+          TRAIN: ${{ matrix.train }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           cd src
+          TRAIN_FLAG="--no-train"
+          if [ "$TRAIN" = "1" ]; then TRAIN_FLAG=""; fi
           scripts/builder/build.sh "../disc.iso" \
             --combined-optimizations --lean-blocks --lean-memory --lean-deadlines --behaviour-timing \
-            --no-train --device-cpu apple-a13 --ipa build/out.ipa
+            $TRAIN_FLAG --device-cpu apple-a13 --ipa build/out.ipa
+          grep -h "native-entries\|tiered\|hooked" build/device/logs/*.log | tail -20 || true
           python3 - <<'PY'
-          import hashlib, os, pathlib
+          import hashlib, os, pathlib, zipfile
+          ipa = pathlib.Path("build/out.ipa")
+          with zipfile.ZipFile(ipa, "a") as z:
+              z.writestr("Payload/BlueWake.app/DrawFusion", "1\n")
           key = hashlib.sha256(os.environ["K_VAL"].encode()).digest()
-          data = bytearray(pathlib.Path("build/out.ipa").read_bytes())
-          out = bytearray(len(data))
-          for off in range(0, len(data), 64):
-              blk = hashlib.blake2b(off.to_bytes(8, "little"), key=key).digest()
-              chunk = data[off:off+64]
-              out[off:off+len(chunk)] = bytes(a ^ b for a, b in zip(chunk, blk))
+          data = ipa.read_bytes()
+          n = len(data)
+          ks = bytearray(n + 64)
+          for off in range(0, n, 64):
+              ks[off:off+64] = hashlib.blake2b(off.to_bytes(8, "little"), key=key).digest()
+          del ks[n:]
+          out = (int.from_bytes(data, "little") ^ int.from_bytes(ks, "little")).to_bytes(n, "little")
           pathlib.Path("build/output.dat").write_bytes(out)
           PY
 
       - name: Upload encrypted output
         uses: actions/upload-artifact@v4
         with:
-          name: build-output
+          name: build-output-${{ matrix.variant }}
           path: src/build/output.dat
           retention-days: 3
