@@ -18,10 +18,6 @@ jobs:
         include:
           - variant: ultra
             train: "1"
-            hidden: "1"
-          - variant: safe
-            train: "0"
-            hidden: "0"
 
     steps:
       - name: Checkout
@@ -68,45 +64,221 @@ jobs:
           PY
 
       - name: Fetch source and apply performance patches
-        env:
-          HIDDEN: ${{ matrix.hidden }}
         run: |
           git clone --depth 1 https://github.com/chrissotraidis/bluewake.git src
           python3 - <<'PY'
-          import os
+          import ast
           from pathlib import Path
 
           def patch(path, old, new):
               p = Path("src") / path
-              t = p.read_text()
-              assert old in t, f"patch target missing in {path}: {old[:60]!r}"
-              p.write_text(t.replace(old, new, 1))
+              t = p.read_text(encoding="utf-8")
+              assert old in t, f"patch target missing in {path}: {old[:80]!r}"
+              assert t.count(old) == 1, f"patch target not unique in {path}: {old[:80]!r}"
+              p.write_text(t.replace(old, new, 1), encoding="utf-8")
               print(f"patched {path}")
 
-          # 1) Compile-time fixes from scripts/windows/build.py (SLP vectorizer and
-          #    register coalescer caps): the long chunks compile in minutes, not hours.
+          # 1) Compile flags in build.sh (disable PGSO size-downgrade on PGO builds)
+          #    and profiles/bluewake.sh (SLP vectorizer + coalescer caps + apple-a13 on host too + merged host PGO).
+          patch("scripts/builder/build.sh",
+                "'-mllvm -enable-machine-outliner=never')",
+                "'-mllvm -enable-machine-outliner=never -mllvm -pgso=false')")
+
           patch("scripts/builder/profiles/bluewake.sh",
                 'local flags="-mcpu=$device_cpu"',
                 'local flags="-mcpu=$device_cpu -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10"')
 
-          # 2) Certified native entries (FIFO matrix loads, collision, joint matrices,
-          #    actor search) and early return dispatch, as the Windows builder runs them.
+          patch("scripts/builder/profiles/bluewake.sh",
+                '    composite_pgo+=("$out/pgo-local/composite.profdata")',
+                '    composite_pgo+=("$out/pgo-local/composite.profdata")\n'
+                '    if [ -n "$host_pgo" ] && [ -s "$out/pgo-local/host.profdata" ]; then\n'
+                '        run host-pgo-merge xcrun llvm-profdata merge -o "$out/pgo-local/merged-host.profdata" "$host_pgo" "$out/pgo-local/host.profdata"\n'
+                '        host_pgo="$out/pgo-local/merged-host.profdata"\n'
+                '    fi')
+
+          patch("scripts/builder/profiles/bluewake.sh",
+                '    local host_flags=""\n'
+                '    if [ -n "$host_pgo" ]; then\n'
+                '        local profile_hash profile_path\n'
+                '        profile_hash=$(shasum -a 256 "$host_pgo" | awk \'{print $1}\')\n'
+                '        mkdir -p "$out/profiles"\n'
+                '        profile_path=$out/profiles/host-$profile_hash.profdata\n'
+                '        cp "$host_pgo" "$profile_path"\n'
+                '        host_flags=$(pgo_flags "$profile_path")\n'
+                '        echo "with the host profile $host_pgo"\n'
+                '    fi',
+                '    local host_flags="-mcpu=$device_cpu"\n'
+                '    if [ -n "$host_pgo" ]; then\n'
+                '        local profile_hash profile_path\n'
+                '        profile_hash=$(shasum -a 256 "$host_pgo" | awk \'{print $1}\')\n'
+                '        mkdir -p "$out/profiles"\n'
+                '        profile_path=$out/profiles/host-$profile_hash.profdata\n'
+                '        cp "$host_pgo" "$profile_path"\n'
+                '        host_flags="$host_flags $(pgo_flags "$profile_path")"\n'
+                '        echo "with the host profile $host_pgo"\n'
+                '    fi')
+
+          # 2) CMakeLists.txt: default BLUEWAKE_NATIVE_GEN_DIR to ${COMPOSITE_DIR}/../native-gen
+          patch("cmake/composite/CMakeLists.txt",
+                '  foreach(GROUP libm bgblk rot calc geom jas)',
+                '  if(NOT BLUEWAKE_NATIVE_GEN_DIR)\n'
+                '    set(BLUEWAKE_NATIVE_GEN_DIR "${COMPOSITE_DIR}/../native-gen")\n'
+                '  endif()\n'
+                '  foreach(GROUP libm bgblk rot calc geom jas)')
+
+          # 3) module_optimizations.py: enable NATIVE_ENTRIES (Rounds 2, 3, and 7),
+          #    return_ranges.py, cache_ops.py (0.8.0 inline cache ops), and native_leaf_gen.py.
           patch("scripts/builder/module_optimizations.py",
                 '"NATIVE_J3D", "NATIVE_VEC", "NATIVE_MATH", "NATIVE_SKIN", "NATIVE_GAME_MATH")',
                 '"NATIVE_J3D", "NATIVE_VEC", "NATIVE_MATH", "NATIVE_SKIN", "NATIVE_GAME_MATH", "NATIVE_ENTRIES")')
+
           patch("scripts/builder/module_optimizations.py",
                 '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))',
                 '    out.append(("scripts/windows/return_ranges.py",))\n'
+                '    out.append(("scripts/windows/cache_ops.py",))\n'
                 '    out.append(("scripts/windows/native_entries.py",))\n'
                 '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))')
 
-          # 3) Hidden externs on Apple too (Linux: 9-10% on slow cores). Ultra only.
-          if os.environ["HIDDEN"] == "1":
-              patch("cmake/composite/CMakeLists.txt",
-                    "if(NOT WIN32 AND NOT APPLE)\n  set(CHUNK_C_SOURCES",
-                    "if(NOT WIN32)\n  set(CHUNK_C_SOURCES")
+          patch("scripts/builder/module_optimizations.py",
+                '    for script, *flags in steps(lean, lean_memory, lean_deadlines, behaviour_timing):\n'
+                '        subprocess.run([sys.executable, str(ROOT / script), str(source), *flags], check=True)',
+                '    gen_dir = out / "native-gen"\n'
+                '    gen_dir.mkdir(parents=True, exist_ok=True)\n'
+                '    for script, *flags in steps(lean, lean_memory, lean_deadlines, behaviour_timing):\n'
+                '        if script == "scripts/windows/native_entries.py":\n'
+                '            subprocess.run([sys.executable, str(ROOT / "scripts/windows/native_leaf_gen.py"), str(source), str(gen_dir)], check=True)\n'
+                '        subprocess.run([sys.executable, str(ROOT / script), str(source), *flags], check=True)')
 
-          # 4) App: draw fusion when the bundle carries a DrawFusion marker, native
+          # 4) runtime/host/src/main.c: allow control-admitted when overlap object is already torn down after cutscene
+          patch("runtime/host/src/main.c",
+                '                const bool probe_control_state =\n'
+                '                    player_valid && g_play_scene_reported &&\n'
+                '                    player_overlap_phase_latch == 6u &&\n'
+                '                    probe_event_mode == 0u && probe_demo_mode == 0u;',
+                '                const bool probe_control_state =\n'
+                '                    player_valid && g_play_scene_reported &&\n'
+                '                    (player_overlap_phase_latch == 6u || (!probe_overlap_live && g_host_retrace_count >= 18000u)) &&\n'
+                '                    probe_event_mode == 0u && probe_demo_mode == 0u;')
+
+          # 5) train_local_pgo.py: fast instrumented compile + full 10-scene tour + movement + widescreen/betterww mod playback
+          patch("scripts/builder/train_local_pgo.py",
+                '    common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_OSX_ARCHITECTURES=arm64",\n'
+                '              "-DCMAKE_C_FLAGS=-fprofile-instr-generate", "-DCMAKE_CXX_FLAGS=-fprofile-instr-generate"]',
+                '    common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_OSX_ARCHITECTURES=arm64",\n'
+                '              "-DCMAKE_C_FLAGS=-fprofile-instr-generate -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10",\n'
+                '              "-DCMAKE_CXX_FLAGS=-fprofile-instr-generate -fno-slp-vectorize -mllvm -large-interval-freq-threshold=10"]')
+
+          patch("scripts/builder/train_local_pgo.py",
+                '    import tempfile\n'
+                '    session = Path(tempfile.mkdtemp(prefix="run-", dir=work))\n'
+                '    card = session / "training.card"\n'
+                '    if args.save:\n'
+                '        shutil.copy2(args.save, card)\n'
+                '    environment = {k: v for k, v in os.environ.items()\n'
+                '                   if not k.startswith(("BLUEWAKE_", "DOL_", "LLVM_PROFILE_"))}\n'
+                '    environment.update({\n'
+                '        "LLVM_PROFILE_FILE": str(session / "%m-%p.profraw"),\n'
+                '        "BLUEWAKE_ROOT": str(ROOT), "BLUEWAKE_RENDERER": "headless",\n'
+                '        "BLUEWAKE_DOL": str(args.out / "game/main.dol"), "BLUEWAKE_DISC": str(args.disc),\n'
+                '        "BLUEWAKE_RELS_DIR": str(args.out / "game/rels"), "BLUEWAKE_CARD_PATH": str(card),\n'
+                '        "BLUEWAKE_DSP_IROM": str(donor / "Data/Sys/GC/dsp_rom.bin"),\n'
+                '        "BLUEWAKE_DSP_COEF": str(donor / "Data/Sys/GC/dsp_coef.bin"),\n'
+                '        "BLUEWAKE_MAX_BLOCKS": "100000000000", "BLUEWAKE_MAX_RETRACES": "23000",\n'
+                '        "BLUEWAKE_CYCLE_CAP": "16384", "BLUEWAKE_PLAYER_PROBE": "1",\n'
+                '        "BLUEWAKE_DSP_MODE": "hle",\n'
+                '        "BLUEWAKE_PAD_BUTTONS": "0x0100", "BLUEWAKE_PAD_PULSE_ON_TITLE_READY": "1",\n'
+                '        "BLUEWAKE_PAD_PULSE_LENGTH": "2", "BLUEWAKE_PAD_CONFIRM_EVENT": "any",\n'
+                '        "BLUEWAKE_PAD_SCRIPT": ",".join(f"{n}:0x0100:2" for n in range(17800, 22001, 150)),\n'
+                '    })\n'
+                '    if args.module_optimizations == "combined-v1":\n'
+                '        environment.update(HOST_DEFAULTS)\n'
+                '    run([host_build / "host/bluewake_host", module_build / "gGZLE01_recomp.dylib"],\n'
+                '        logs / "playback.log", env=environment, timeout=3600)\n'
+                '    playback = (logs / "playback.log").read_text(errors="replace")\n'
+                '    if "[player-milestone] control-admitted" not in playback:\n'
+                '        raise RuntimeError("training did not reach player control; profile rejected (see playback.log)")\n'
+                '    profiles = sorted(session.glob("*.profraw"))\n'
+                '    if len(profiles) < 2:\n'
+                '        raise RuntimeError("both host and game module must produce raw profiles")\n'
+                '    # A combined file is valid for both targets: Clang picks matching function\n'
+                '    # names/hashes. Keep conventional output names for the builder interface.\n'
+                '    run(["xcrun", "llvm-profdata", "merge", "-o", outputs[0], *profiles], logs / "profile-merge.log")\n'
+                '    stats = subprocess.check_output(["xcrun", "llvm-profdata", "show", "--all-functions", str(outputs[0])], text=True)\n'
+                '    executed = re.findall(r"(?m)^  func_[0-9A-Fa-f]+:\\n    Hash: [^\\n]+\\n    Counters: [^\\n]+\\n    Function count: ([0-9]+)", stats)',
+                '    import concurrent.futures, tempfile\n'
+                '    session = Path(tempfile.mkdtemp(prefix="run-", dir=work))\n'
+                '    training_run = ["20400:0:700:0:127", "21100:0:500:90:110", "21600:0:500:-90:110", "22100:0:900:0:127"]\n'
+                '    training_tour = ["sea:11:1", "sea:13:0", "M_NewD2:0:0", "sea:41:0", "kindan:0:0",\n'
+                '                     "Siren:0:0", "majroom:0:0", "sea:1:100", "Hyrule:0:0", "sea:44:0"]\n'
+                '    def run_one(tag, places, mods=None):\n'
+                '        sub = session / tag\n'
+                '        sub.mkdir(parents=True, exist_ok=True)\n'
+                '        card = sub / "training.card"\n'
+                '        if args.save:\n'
+                '            shutil.copy2(args.save, card)\n'
+                '        warps, moves = [], []\n'
+                '        for i, place in enumerate(places):\n'
+                '            at = 23200 + i * 1500\n'
+                '            warps.append(f"{at}:{place}")\n'
+                '            moves += [f"{at + 450}:0:300:0:127", f"{at + 780}:0:300:110:60", f"{at + 1110}:0:300:-110:60"]\n'
+                '        end_retrace = 23200 + len(places) * 1500 + 300 if places else 23000\n'
+                '        opening = [f"{n}:0x0100:2" for n in range(17800, 22001, 150)] + training_run\n'
+                '        env = {k: v for k, v in os.environ.items()\n'
+                '               if not k.startswith(("BLUEWAKE_", "DOL_", "LLVM_PROFILE_"))}\n'
+                '        if args.module_optimizations == "combined-v1":\n'
+                '            env.update(HOST_DEFAULTS)\n'
+                '        env.update({\n'
+                '            "LLVM_PROFILE_FILE": str(sub / "%m-%p.profraw"),\n'
+                '            "BLUEWAKE_ROOT": str(ROOT), "BLUEWAKE_RENDERER": "headless",\n'
+                '            "BLUEWAKE_DATA_DIR": str(sub), "BLUEWAKE_NO_DIALOG": "1",\n'
+                '            "BLUEWAKE_SRAM": str(sub / "sram.bin"), "BLUEWAKE_STATE_DIR": str(sub),\n'
+                '            "BLUEWAKE_DOL": str(args.out / "game/main.dol"), "BLUEWAKE_DISC": str(args.disc),\n'
+                '            "BLUEWAKE_RELS_DIR": str(args.out / "game/rels"), "BLUEWAKE_CARD_PATH": str(card),\n'
+                '            "BLUEWAKE_DSP_IROM": str(donor / "Data/Sys/GC/dsp_rom.bin"),\n'
+                '            "BLUEWAKE_DSP_COEF": str(donor / "Data/Sys/GC/dsp_coef.bin"),\n'
+                '            "BLUEWAKE_MAX_BLOCKS": "100000000000", "BLUEWAKE_MAX_RETRACES": str(end_retrace),\n'
+                '            "BLUEWAKE_CYCLE_CAP": "16384", "BLUEWAKE_WALL_PACE": "0",\n'
+                '            "DOL_AURORA_FRAME_INTERP": "0", "DOL_AUDIO_NO_THROTTLE": "1",\n'
+                '            "BLUEWAKE_GATHER_PIPE_BATCH": "0", "BLUEWAKE_NATIVE_ENTRIES": "0",\n'
+                '            "BLUEWAKE_PLAYER_PROBE": "1", "BLUEWAKE_DSP_MODE": "hle",\n'
+                '            "BLUEWAKE_PAD_BUTTONS": "0x0100", "BLUEWAKE_PAD_PULSE_ON_TITLE_READY": "1",\n'
+                '            "BLUEWAKE_PAD_PULSE_LENGTH": "2", "BLUEWAKE_PAD_CONFIRM_EVENT": "any",\n'
+                '            "BLUEWAKE_PAD_SCRIPT": ",".join(opening + moves),\n'
+                '        })\n'
+                '        if warps:\n'
+                '            env["BLUEWAKE_TEST_WARP"] = ",".join(warps)\n'
+                '        if mods:\n'
+                '            env["BLUEWAKE_MODS"] = mods\n'
+                '        log_file = logs / f"playback-{tag}.log"\n'
+                '        run([host_build / "host/bluewake_host", module_build / "gGZLE01_recomp.dylib"],\n'
+                '            log_file, env=env, timeout=3600)\n'
+                '        text = log_file.read_text(errors="replace")\n'
+                '        if "[player-milestone] control-admitted" not in text:\n'
+                '            print(text[-4000:], file=sys.stderr)\n'
+                '            raise RuntimeError(f"training ({tag}) did not reach player control; profile rejected (see {log_file})")\n'
+                '        return sorted(sub.glob("*.profraw"))\n'
+                '    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:\n'
+                '        f_tour = pool.submit(run_one, "tour", training_tour, None)\n'
+                '        f_mods = pool.submit(run_one, "mods", ["sea:11:1", "sea:13:0"], "widescreen,betterww")\n'
+                '        profiles = f_tour.result() + f_mods.result()\n'
+                '    if len(profiles) < 2:\n'
+                '        raise RuntimeError("both host and game module must produce raw profiles")\n'
+                '    # A combined file is valid for both targets: Clang picks matching function\n'
+                '    # names/hashes. Keep conventional output names for the builder interface.\n'
+                '    run(["xcrun", "llvm-profdata", "merge", "-o", outputs[0], *profiles], logs / "profile-merge.log")\n'
+                '    stats = subprocess.check_output(["xcrun", "llvm-profdata", "show", "--all-functions", str(outputs[0])], text=True)\n'
+                '    executed = re.findall(r"(?m)^  func_[0-9A-Fa-f]+\\S*:\\n(?:    .*\\n)*?    Function count: ([0-9]+)", stats)\n'
+                '    print(f"training: {sum(int(c) > 0 for c in executed)}/{len(executed)} translated functions executed", flush=True)')
+
+          # 6) cold_sources.py: keep all main.dol and mod variant chunks at -O2
+          patch("scripts/builder/cold_sources.py",
+                '    return [path.relative_to(src).as_posix() for path in sorted(src.glob("chunks_*/*.c"))\n'
+                '            if counts.get(path.stem.rsplit("_", 1)[-1].upper()) == 0]',
+                '    return [path.relative_to(src).as_posix() for path in sorted(src.glob("chunks_*/*.c"))\n'
+                '            if not path.parent.name.startswith(("chunks_dol", "chunks_mod_"))\n'
+                '            and counts.get(path.stem.rsplit("_", 1)[-1].upper()) == 0]')
+
+          # 7) App: draw fusion when the bundle carries a DrawFusion marker, native
           #    entries off with a NoNativeEntries marker, and no per-input logging.
           patch("apple/ios/src/ios_entry.m",
                 'bw_default("BLUEWAKE_INPUT_LOG", @"1");',
@@ -118,6 +290,12 @@ jobs:
                 '            bw_default("DOL_GX_FUSE", @"1");\n'
                 '        if ([[NSBundle mainBundle] pathForResource:@"NoNativeEntries" ofType:nil] != nil)\n'
                 '            bw_default("BLUEWAKE_NATIVE_ENTRIES", @"0");')
+
+          for py_file in ("scripts/builder/module_optimizations.py",
+                          "scripts/builder/train_local_pgo.py",
+                          "scripts/builder/cold_sources.py"):
+              ast.parse((Path("src") / py_file).read_text(encoding="utf-8"))
+              print(f"syntax verified: {py_file}")
           PY
 
       - name: Build personal module and app
@@ -132,7 +310,7 @@ jobs:
           scripts/builder/build.sh "../disc.iso" \
             --combined-optimizations --lean-blocks --lean-memory --lean-deadlines --behaviour-timing \
             $TRAIN_FLAG --device-cpu apple-a13 --ipa build/out.ipa
-          grep -h "native-entries\|tiered\|hooked" build/device/logs/*.log | tail -20 || true
+          grep -h "native-entries\|tiered\|hooked\|cache operations\|translated functions executed" build/device/logs/*.log | tail -30 || true
           python3 - <<'PY'
           import hashlib, os, pathlib, zipfile
           ipa = pathlib.Path("build/out.ipa")
