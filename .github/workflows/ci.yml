@@ -133,11 +133,17 @@ jobs:
                 '"NATIVE_J3D", "NATIVE_VEC", "NATIVE_MATH", "NATIVE_SKIN", "NATIVE_GAME_MATH", "NATIVE_ENTRIES")')
 
           patch("scripts/builder/module_optimizations.py",
-                '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))',
-                '    out.append(("scripts/windows/return_ranges.py",))\n'
-                '    out.append(("scripts/windows/cache_ops.py",))\n'
-                '    out.append(("scripts/windows/native_entries.py",))\n'
-                '    if behaviour_timing:\n        out.append(("scripts/windows/behaviour_timing.py", "--loop-checks"))')
+                '        if lean_memory and step[0] == "scripts/windows/direct_calls.py":\n'
+                '            out.append(("scripts/windows/lean_memory.py",))\n'
+                '            if lean_deadlines:\n'
+                '                out.append(("scripts/windows/lean_deadlines.py",))',
+                '        if lean_memory and step[0] == "scripts/windows/direct_calls.py":\n'
+                '            out.append(("scripts/windows/lean_memory.py",))\n'
+                '            out.append(("scripts/windows/return_ranges.py",))\n'
+                '            out.append(("scripts/windows/native_entries.py",))\n'
+                '            out.append(("scripts/windows/cache_ops.py",))\n'
+                '            if lean_deadlines:\n'
+                '                out.append(("scripts/windows/lean_deadlines.py",))')
 
           patch("scripts/builder/module_optimizations.py",
                 '    for script, *flags in steps(lean, lean_memory, lean_deadlines, behaviour_timing):\n'
