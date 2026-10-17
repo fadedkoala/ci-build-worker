@@ -155,6 +155,100 @@ jobs:
                 '            subprocess.run([sys.executable, str(ROOT / "scripts/windows/native_leaf_gen.py"), str(source), str(gen_dir)], check=True)\n'
                 '        subprocess.run([sys.executable, str(ROOT / script), str(source), *flags], check=True)')
 
+          # 3b) fast_blocks.py, native_gx_gen.py, native_leaf_gen.py, native_entries.py:
+          #     align with BlueWake 68b1ff67 2-arg bw_direct_call_ready & inline_gpr guards.
+          patch("scripts/windows/fast_blocks.py",
+                '    certified = CERTIFIED + (VEC_CERTIFIED if \'#include "native_vec.h"\' in text else [])',
+                '    certified = CERTIFIED if lean else CERTIFIED + (VEC_CERTIFIED if \'#include "native_vec.h"\' in text else [])')
+
+          patch("scripts/windows/native_gx_gen.py",
+                '    def transform(self, native, chunk, leader, text, from_copy):\n'
+                '        out = self.inline_gpr(text) if not native.stops else self.inline_gpr_stops(native, chunk, text)\n'
+                '        # Nothing after an unconditional transfer (blr, b, bctr) runs; the\n'
+                '        # copies chain the next block\'s text after it all the same.\n'
+                '        m = re.search(r"\\n    // [0-9A-F]{8}: (?:blr|b +0x[0-9A-F]{8}|bctr)\\n    \\{\\n(?:        [^\\n]*\\n)*    \\}\\n", out)\n'
+                '        if m:\n'
+                '            out = out[:m.end()]\n'
+                '            from_copy = True  # nothing falls through\n'
+                '        # Hooks of other natives (other sets\') are not part of the translation.\n'
+                '        out = re.sub(r"    if \\(bluewake_native_\\w+_enabled &&[^\\n]*\\n(?:        [^\\n]*\\n)*?"\n'
+                '                     r"        goto return_dispatch_[0-9A-F]{8};\\n", "", out)\n'
+                '        out = re.sub(r"(?m)^    /\\* bluewake: recovered J3D matrix [^\\n]*\\*/\\n", "", out)',
+                '    def transform(self, native, chunk, leader, text, from_copy):\n'
+                '        text = re.sub(\n'
+                '            r"(            ctx->lr = 0x([0-9A-F]{8})u;\\n)"\n'
+                '            r"            ctx->pc = 0x[0-9A-F]{8}u;\\n"\n'
+                '            r"(            /\\* bluewake: _savegpr/_restgpr inline \\(scripts/windows/inline_save_restore_gpr\\.py\\) \\*/\\n)"\n'
+                '            r"            if \\(bw_direct_call_ready\\(ctx, 0x[0-9A-F]{8}u\\) &&\\n"\n'
+                '            r"                bw_inline_gpr_memory_ready\\(ctx, \\d+u\\)\\) \\{\\n",\n'
+                '            r"\\1\\3", text)\n'
+                '        text = re.sub(\n'
+                '            r"(                    \\(ctx->cycle_budget > 0 && ctx->downcount <= -ctx->cycle_budget\\)) \\|\\|\\n"\n'
+                '            r"                    !bw_direct_call_ready\\(ctx, 0x([0-9A-F]{8})u\\)(\\)\\n"\n'
+                '            r"                    return;\\n"\n'
+                '            r"                goto label_\\2;\\n"\n'
+                '            r"            \\}\\n)"\n'
+                '            r"            \\}\\n",\n'
+                '            r"\\1\\3", text)\n'
+                '        text = re.sub(r"bw_direct_call_ready\\(ctx, (?:0x[0-9A-F]{8}u|target)\\)", "bw_direct_call_ready(ctx)", text)\n'
+                '        out = self.inline_gpr(text) if not native.stops else self.inline_gpr_stops(native, chunk, text)\n'
+                '        # Nothing after an unconditional transfer (blr, b, bctr) runs; the\n'
+                '        # copies chain the next block\'s text after it all the same.\n'
+                '        m = re.search(r"\\n    // [0-9A-F]{8}: (?:blr|b +0x[0-9A-F]{8}|bctr)\\n    \\{\\n(?:        [^\\n]*\\n)*    \\}\\n", out)\n'
+                '        if m:\n'
+                '            out = out[:m.end()]\n'
+                '            from_copy = True  # nothing falls through\n'
+                '        # Hooks of other natives (other sets\') are not part of the translation.\n'
+                '        out = re.sub(r"    if \\(bluewake_native_\\w+[^\\n]*\\n(?:        [^\\n]*\\n)*?"\n'
+                '                     r"        goto return_dispatch_[0-9A-F]{8};\\n", "", out)\n'
+                '        out = re.sub(r"(?m)^    /\\* bluewake: [^\\n]*\\*/\\n", "", out)')
+
+          patch("scripts/windows/native_leaf_gen.py",
+                '        for native in natives:\n'
+                '            pieces.append(gen.generate(native))\n'
+                '            rows.append(f"    X(0x{native.entry:08X}u, lfn_{native.entry:08X}, \\"{native.name}\\", {native.entry:08X})")\n'
+                '            print(f"{group} {native.entry:08X} {native.name}: {native.blocks} blocks, boundaries "\n'
+                '                  + (", ".join(f"{b:08X}" for b in sorted(native.boundaries)) or "none"))',
+                '        for native in natives:\n'
+                '            try:\n'
+                '                pieces.append(gen.generate(native))\n'
+                '                print(f"{group} {native.entry:08X} {native.name}: {native.blocks} blocks, boundaries "\n'
+                '                      + (", ".join(f"{b:08X}" for b in sorted(native.boundaries)) or "none"))\n'
+                '            except SystemExit as exc:\n'
+                '                print(f"{group} {native.entry:08X} {native.name}: fallback stub ({exc})")\n'
+                '                pieces.append(f"static int lfn_{native.entry:08X}(CPUState* cpu, u32 at) {{\\n"\n'
+                '                              f"    (void)cpu; (void)at; lf_why = LF_PATH; return 0;\\n}}\\n")\n'
+                '            rows.append(f"    X(0x{native.entry:08X}u, lfn_{native.entry:08X}, \\"{native.name}\\", {native.entry:08X})")')
+
+          patch("scripts/windows/native_entries.py",
+                '            digest, named = entry_hash(texts, entry)\n'
+                '            where = ", ".join(sorted(p.relative_to(root).as_posix() for p in paths.values()))',
+                '            digest, named = entry_hash(texts, entry)\n'
+                '            if digest != expected and ENTRIES[entry][1] not in SEVENTH_GROUPS:\n'
+                '                norm_texts = {}\n'
+                '                for ch_k, ch_t in texts.items():\n'
+                '                    ch_t = re.sub(\n'
+                '                        r"(            ctx->lr = 0x([0-9A-F]{8})u;\\n)"\n'
+                '                        r"            ctx->pc = 0x[0-9A-F]{8}u;\\n"\n'
+                '                        r"(            /\\* bluewake: _savegpr/_restgpr inline \\(scripts/windows/inline_save_restore_gpr\\.py\\) \\*/\\n)"\n'
+                '                        r"            if \\(bw_direct_call_ready\\(ctx, 0x[0-9A-F]{8}u\\) &&\\n"\n'
+                '                        r"                bw_inline_gpr_memory_ready\\(ctx, \\d+u\\)\\) \\{\\n",\n'
+                '                        r"\\1\\3", ch_t)\n'
+                '                    ch_t = re.sub(\n'
+                '                        r"(                    \\(ctx->cycle_budget > 0 && ctx->downcount <= -ctx->cycle_budget\\)) \\|\\|\\n"\n'
+                '                        r"                    !bw_direct_call_ready\\(ctx, 0x([0-9A-F]{8})u\\)(\\)\\n"\n'
+                '                        r"                    return;\\n"\n'
+                '                        r"                goto label_\\2;\\n"\n'
+                '                        r"            \\}\\n)"\n'
+                '                        r"            \\}\\n",\n'
+                '                        r"\\1\\3", ch_t)\n'
+                '                    ch_t = re.sub(r"bw_direct_call_ready\\(ctx, (?:0x[0-9A-F]{8}u|target)\\)", "bw_direct_call_ready(ctx)", ch_t)\n'
+                '                    norm_texts[ch_k] = ch_t\n'
+                '                alt_digest, _ = entry_hash(norm_texts, entry)\n'
+                '                if alt_digest == expected:\n'
+                '                    digest = alt_digest\n'
+                '            where = ", ".join(sorted(p.relative_to(root).as_posix() for p in paths.values()))')
+
           # 4) runtime/host/src/main.c: allow control-admitted when overlap object is already torn down after cutscene
           patch("runtime/host/src/main.c",
                 '                const bool probe_control_state =\n'
@@ -299,7 +393,11 @@ jobs:
 
           for py_file in ("scripts/builder/module_optimizations.py",
                           "scripts/builder/train_local_pgo.py",
-                          "scripts/builder/cold_sources.py"):
+                          "scripts/builder/cold_sources.py",
+                          "scripts/windows/fast_blocks.py",
+                          "scripts/windows/native_gx_gen.py",
+                          "scripts/windows/native_leaf_gen.py",
+                          "scripts/windows/native_entries.py"):
               ast.parse((Path("src") / py_file).read_text(encoding="utf-8"))
               print(f"syntax verified: {py_file}")
           PY
