@@ -64,7 +64,7 @@ jobs:
 
       - name: Fetch source and setup
         run: |
-          git clone --depth 1 https://github.com/chrissotraidis/bluewake.git src
+          git clone --depth 1 --branch v0.9.0 https://github.com/chrissotraidis/bluewake.git src
           python3 - <<'PY'
           from pathlib import Path
           ios_entry = Path("src/apple/ios/src/ios_entry.m")
